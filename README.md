@@ -8,22 +8,25 @@ loggly posts are done in goroutines, writing to stderr is not optimized, more fo
 loggly only posts in production env
 
 ### Loggly
-set hardcoded logglyUrl at the top of plywood.go to your loggly api key url
+Update the hardcoded api key in loggly.go
+API endpoint: "https://logs-01.loggly.com/inputs/apikey/"
 
 ### Running
 ```go
-# -logtologglya is async requests to loggly in seperate goroutines
-./myapp -env=production -logtostderr -logtologglya -loglevel=1
+# -plytologglya is async requests to loggly in seperate goroutines -plytologgly for sync request testing
+./myapp -plyenv=production -plytostderr -plytologglya -plylevel=1 -plytimethresh=100.0
 ```
 
 ### Example
 ```go
 import (
-	"flag"
-	log "plywood"
+	"time"
+
+	log "github.ngmoco.com/Eurisko/plywood"
 )
 
 func main() {
+	defer log.TimeTrack(time.Now(), "some key")
 	//log.SetEnv("production")
 	//log.SetLogger("loggly")
 	//log.SetLogger("stderr")
@@ -31,6 +34,7 @@ func main() {
 	log.Debug("some debug")
 	log.Info("some info")
 	log.Error("some error")
+	log.Error(map[string]interface{}{"custom": 12.1})
 	log.Errorf("some error %s", err)
 	log.Warning("some warning")
 	log.Fatal("fatal")

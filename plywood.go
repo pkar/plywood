@@ -16,12 +16,9 @@ import (
 	"time"
 )
 
-// Level represents log levels which are sorted based on the underlying number associated to it.
-type Level uint8
-
 // Definitions of available levels: Debug < Info < Warning < Error.
 const (
-	DEBUG Level = iota
+	DEBUG uint = iota
 	INFO
 	WARNING
 	ERROR
@@ -29,7 +26,7 @@ const (
 )
 
 const (
-	logglyUrl = "https://urltologgly/key"
+	logglyUrl = "https://logs-01.loggly.com/inputs/apikey/"
 )
 
 var (
@@ -60,38 +57,35 @@ type LogglyPost struct {
 
 // Abstraction of log event sender.
 type Sender interface {
-	Send(string, interface{}) error
+	Send(string, string, interface{}) error
 }
 
 // Console implements sender and logs events to the console.
 type Console struct {
-	Env string
-	App string
-	w   io.Writer
-	m   *sync.Mutex
+	w io.Writer
+	m *sync.Mutex
 }
 
 // Loggly contains the meta for sending log events to loggly.
 // Loggly implements sender.
 type Loggly struct {
 	Client *http.Client
-	Env    string
-	App    string
-	Host   string
 	url    string
 }
 
 // Log contains the set loggers. Log output will be sent to
 // and Log.Loggers defined (loggly, stderr, stdout)
 type Log struct {
-	Host      string
-	App       string
-	Env       string
-	Loggers   map[string]Sender
-	level     Level
-	toStderr  bool
-	toLoggly  bool
-	toLogglya bool // async loggly posts
+	Host               string
+	App                string
+	Env                string
+	Loggers            map[string]Sender
+	level              uint
+	toStderr           bool
+	toStdout           bool
+	toLoggly           bool
+	toLogglya          bool // async loggly posts
+	timeTrackThreshold float64
 }
 
 // global logger created on package initialization.
@@ -117,35 +111,18 @@ func init() {
 	}
 
 	logger = New("", "", INFO)
-	//flag.BoolVar(&logger.toStderr, "logtostderr", false, "log to standard error")
-	flag.BoolVar(&logger.toLoggly, "logtologgly", false, "log to loggly")
-	flag.BoolVar(&logger.toLogglya, "logtologglya", false, "log to loggly")
-	//flag.StringVar(&logger.Env, "env", "development", "set environment")
-	var l uint
-	flag.UintVar(&l, "loglevel", uint(INFO), "set logging level 0=Debug 1=Info 2=Error 3=Warning 4=Fatal")
-	switch l {
-	case 0:
-		logger.level = DEBUG
-	case 1:
-		logger.level = INFO
-	case 2:
-		logger.level = ERROR
-	case 3:
-		logger.level = WARNING
-	case 4:
-		logger.level = FATAL
-	default:
-		logger.level = INFO
-	}
-	//flag.Parse()
+	flag.BoolVar(&logger.toStderr, "plytostderr", false, "log to standard error")
+	flag.BoolVar(&logger.toStdout, "plytostdout", false, "log to standard out")
+	flag.BoolVar(&logger.toLoggly, "plytologgly", false, "log to loggly")
+	flag.BoolVar(&logger.toLogglya, "plytologglya", false, "log to loggly async")
+	flag.StringVar(&logger.Env, "plyenv", "development", "set environment")
+	flag.Float64Var(&logger.timeTrackThreshold, "plytimethresh", 50.0, "set threshold for time track events")
+	flag.UintVar(&logger.level, "plylevel", INFO, "set logging level 0=Debug 1=Info 2=Error 3=Warning 4=Fatal")
 
-	if logger.toStderr {
-		logger.SetLogger("stderr")
-	}
-	if logger.toLoggly || logger.toLogglya {
-		logger.SetLogger("loggly")
-	}
-	fmt.Printf("%#v", logger)
+	// create all loggers and set their environments.
+	logger.SetLogger("stderr")
+	logger.SetLogger("stdout")
+	logger.SetLogger("loggly")
 }
 
 // iso8601 returns a formatted string in iso8601 format.
@@ -162,7 +139,7 @@ func iso8601(t time.Time) string {
 
 // New creates a new instance of Log that will log to the provided io.Writer only if the method used
 // for logging is enabled for the provided level. See package documentation for more details and examples.
-func New(appName, env string, level Level) *Log {
+func New(appName, env string, level uint) *Log {
 	return &Log{
 		Host:    host,
 		App:     program,
@@ -173,7 +150,7 @@ func New(appName, env string, level Level) *Log {
 }
 
 // Send a log event to the console.
-func (c *Console) Send(severity string, data interface{}) (err error) {
+func (c *Console) Send(severity, env string, data interface{}) (err error) {
 	c.m.Lock()
 	defer c.m.Unlock()
 	if d, ok := data.(string); ok {
@@ -183,13 +160,13 @@ func (c *Console) Send(severity string, data interface{}) (err error) {
 }
 
 // Send a log event to loggly.
-func (l *Loggly) Send(severity string, data interface{}) error {
+func (l *Loggly) Send(severity, env string, data interface{}) error {
 	p := &LogglyPost{
 		Timestamp: iso8601(timeNow().UTC()),
-		Env:       l.Env,
-		App:       l.App,
-		Host:      l.Host,
-		Caller:    getCallersName(4),
+		Env:       env,
+		App:       program,
+		Host:      host,
+		Caller:    getCallersName(5),
 		Pid:       pid,
 		Level:     severity,
 	}
@@ -222,45 +199,91 @@ func (l *Loggly) Send(severity string, data interface{}) error {
 
 	b, err := json.Marshal(p)
 	if err != nil {
+		fmt.Fprintf(os.Stderr, "E "+err.Error()+"] \n")
 		return err
 	}
 
 	// Only send production and staging events to loggly
 	// If not defined send to stderr
-	if _, ok := logglyEnvironments[l.Env]; !ok {
-		fmt.Fprintf(os.Stderr, string(b)+"\n")
+	if _, ok := logglyEnvironments[env]; !ok {
+		fmt.Fprintf(os.Stderr, "E "+"env not set: "+env+"] "+string(b)+"\n")
 		return nil
 	}
 
 	req, err := http.NewRequest("POST", l.url, strings.NewReader(string(b)))
 	if err != nil {
+		fmt.Fprintf(os.Stderr, "E "+err.Error()+"] "+string(b)+"\n")
 		return err
 	}
 	resp, err := l.Client.Do(req)
 	if err != nil {
+		fmt.Fprintf(os.Stderr, "E "+err.Error()+"] "+string(b)+"\n")
 		return err
 	}
 	defer resp.Body.Close()
 	body, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
+		fmt.Fprintf(os.Stderr, "E "+err.Error()+"] "+string(b)+"\n")
 		return err
 	}
 
 	if resp.StatusCode != 200 {
+		fmt.Fprintf(os.Stderr, "E "+resp.Status+"] "+string(b)+"\n")
 		return fmt.Errorf("%d %s", resp.StatusCode, body)
 	}
 
 	return nil
 }
 
+// TimeTrack is a helper to get function times
+// usage: defer log.TimeTrack(time.Now())
+func TimeTrack(start time.Time, name interface{}) {
+	logger.TimeTrack(start, name)
+}
+
+// TimeTrack is a helper to get function times
+// usage: defer log.TimeTrack(time.Now(), "functionName")
+func (l *Log) TimeTrack(start time.Time, name interface{}) {
+	elapsed := time.Since(start)
+	ms := float64(elapsed) / float64(time.Millisecond)
+	if ms > l.timeTrackThreshold {
+		logger.Info(map[string]interface{}{
+			"time": map[string]interface{}{
+				"name": name,
+				"ms":   ms,
+			},
+		})
+	}
+}
+
+// DebugLogger just prints out the current state of the logger.
+func DebugLogger() {
+	fmt.Fprintf(os.Stderr, "%#v\n", logger)
+}
+
+// DebugLogger just prints out the current state of the logger.
+func (l *Log) DebugLogger() {
+	fmt.Fprintf(os.Stderr, "%#v", l)
+}
+
 // SetLevel changes the logging level for the log instance.
-func SetLevel(lvl Level) {
+func SetLevel(lvl uint) {
 	logger.SetLevel(lvl)
 }
 
 // SetLevel changes the logging level for the log instance.
-func (l *Log) SetLevel(lvl Level) {
+func (l *Log) SetLevel(lvl uint) {
 	l.level = lvl
+}
+
+// SetTimeTrackThreshold logs only events timed higher.
+func SetTimeTrackThreshold(t float64) {
+	logger.SetTimeTrackThreshold(t)
+}
+
+// SetTimeTrackThreshold logs only events timed higher.
+func (l *Log) SetTimeTrackThreshold(t float64) {
+	l.timeTrackThreshold = t
 }
 
 // SetEnv changes the logging environment.
@@ -283,24 +306,18 @@ func (l *Log) SetLogger(logType string) {
 	switch logType {
 	case "loggly":
 		l.Loggers[logType] = &Loggly{
-			App:    l.App,
-			Env:    l.Env,
 			Client: &http.Client{},
-			url:    logglyUrl,
+			url:    logglyUrl + "tag/" + program,
 		}
 	case "stderr":
 		l.Loggers[logType] = &Console{
-			App: l.App,
-			Env: l.Env,
-			w:   os.Stderr,
-			m:   &sync.Mutex{},
+			w: os.Stderr,
+			m: &sync.Mutex{},
 		}
 	case "stdout":
 		l.Loggers[logType] = &Console{
-			App: l.App,
-			Env: l.Env,
-			w:   os.Stdout,
-			m:   &sync.Mutex{},
+			w: os.Stdout,
+			m: &sync.Mutex{},
 		}
 	case "file":
 		// TODO implement
@@ -321,7 +338,7 @@ func Fatalf(fmtStr string, msg ...interface{})         { logger.Fatalf(fmtStr, m
 func (l *Log) Debug(msg ...interface{}) error                 { return l.log(DEBUG, msg...) }
 func (l *Log) Debugf(fmtStr string, msg ...interface{}) error { return l.logf(DEBUG, fmtStr, msg...) }
 func (l *Log) Info(msg ...interface{}) error                  { return l.log(INFO, msg...) }
-func (l *Log) Infof(fmtStr string, msg ...interface{}) error  { return l.logf(DEBUG, fmtStr, msg...) }
+func (l *Log) Infof(fmtStr string, msg ...interface{}) error  { return l.logf(INFO, fmtStr, msg...) }
 func (l *Log) Error(msg ...interface{}) error                 { return l.log(ERROR, msg...) }
 func (l *Log) Errorf(fmtStr string, msg ...interface{}) error { return l.logf(ERROR, fmtStr, msg...) }
 func (l *Log) Warning(msg ...interface{}) error               { return l.log(WARNING, msg...) }
@@ -361,7 +378,7 @@ func header(severity string, depth int) string {
 }
 
 // log is called by all the other leveled logging functions.
-func (l *Log) log(level Level, msg ...interface{}) error {
+func (l *Log) log(level uint, msg ...interface{}) error {
 	if l.level > level {
 		return nil
 	}
@@ -369,7 +386,7 @@ func (l *Log) log(level Level, msg ...interface{}) error {
 }
 
 // logf is called by all the other leveled formatted logging functions.
-func (l *Log) logf(level Level, fmtStr string, msg ...interface{}) error {
+func (l *Log) logf(level uint, fmtStr string, msg ...interface{}) error {
 	if l.level > level {
 		return nil
 	}
@@ -377,46 +394,56 @@ func (l *Log) logf(level Level, fmtStr string, msg ...interface{}) error {
 }
 
 // send performs the request to the set loggers.
-func (l *Log) send(level Level, fmtStr string, msg ...interface{}) error {
+func (l *Log) send(level uint, fmtStr string, msg ...interface{}) error {
 	severity := string(severityChars[level])
-	for logType, logger := range l.Loggers {
-		switch logType {
-		case "loggly":
-			if l.toLogglya {
-				go func(s Sender) {
-					var err error
-					if fmtStr != "" {
-						err = s.Send(severity, fmt.Sprintf(fmtStr, msg...))
-					} else {
-						err = s.Send(severity, msg)
-					}
-					if err != nil {
-						fmt.Fprintf(os.Stderr, err.Error())
-					}
-				}(logger)
-			} else {
-				var err error
-				if fmtStr != "" {
-					err = logger.Send(severity, fmt.Sprintf(fmtStr, msg...))
-				} else {
-					err = logger.Send(severity, msg)
-				}
-				if err != nil {
-					fmt.Fprintf(os.Stderr, err.Error())
-				}
-			}
-		default:
+	if l.toLogglya {
+		go func(s Sender) {
 			var err error
-			h := header(severity, 4)
-			// stderr and stdout
-			if fmtStr == "" {
-				err = logger.Send(severity, h+fmt.Sprint(msg...)+"\n")
+			if fmtStr != "" {
+				err = s.Send(severity, l.Env, fmt.Sprintf(fmtStr, msg...))
 			} else {
-				err = logger.Send(severity, fmt.Sprintf(h+fmtStr+"\n", msg...))
+				err = s.Send(severity, l.Env, msg)
 			}
 			if err != nil {
 				fmt.Fprintf(os.Stderr, err.Error())
 			}
+		}(l.Loggers["loggly"])
+	}
+	if l.toLoggly {
+		var err error
+		if fmtStr != "" {
+			err = l.Loggers["loggly"].Send(severity, l.Env, fmt.Sprintf(fmtStr, msg...))
+		} else {
+			err = l.Loggers["loggly"].Send(severity, l.Env, msg)
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, err.Error())
+		}
+	}
+	if l.toStderr {
+		var err error
+		h := header(severity, 5)
+		// stderr and stdout
+		if fmtStr == "" {
+			err = l.Loggers["stderr"].Send(severity, l.Env, h+fmt.Sprint(msg...)+"\n")
+		} else {
+			err = l.Loggers["stderr"].Send(severity, l.Env, fmt.Sprintf(h+fmtStr+"\n", msg...))
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, err.Error())
+		}
+	}
+	if l.toStdout {
+		var err error
+		h := header(severity, 5)
+		// stderr and stdout
+		if fmtStr == "" {
+			err = l.Loggers["stdout"].Send(severity, l.Env, h+fmt.Sprint(msg...)+"\n")
+		} else {
+			err = l.Loggers["stdout"].Send(severity, l.Env, fmt.Sprintf(h+fmtStr+"\n", msg...))
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, err.Error())
 		}
 	}
 
